@@ -168,6 +168,42 @@ def _debugmodel_fused_qkv(attn_backend: str) -> Llama3Model.Config:
     )
 
 
+def _160m(attn_backend: str) -> Llama3Model.Config:
+    dim = 768
+    n_heads = 12
+    n_layers = 18
+    vocab_size = 32000
+    return Llama3Model.Config(
+        dim=dim,
+        vocab_size=vocab_size,
+        enable_weight_tying=True,
+        tok_embeddings=Embedding.Config(
+            num_embeddings=vocab_size,
+            embedding_dim=dim,
+            param_init=_EMBEDDING_SKIP_INIT,
+        ),
+        norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
+        lm_head=Linear.Config(
+            in_features=dim,
+            out_features=vocab_size,
+            param_init=_output_linear_init(dim),
+        ),
+        layers=_build_llama3_layers(
+            n_layers=n_layers,
+            dim=dim,
+            n_heads=n_heads,
+            hidden_dim=compute_ffn_hidden_dim(dim, multiple_of=256),
+            rope=ComplexRoPE.Config(
+                dim=dim // n_heads,
+                max_seq_len=131072,
+                theta=500000,
+                scaling="llama",
+            ),
+            attn_backend=attn_backend,
+        ),
+    )
+
+
 def _1b(attn_backend: str) -> Llama3Model.Config:
     dim = 2048
     n_heads = 32
@@ -362,6 +398,7 @@ def _405b(attn_backend: str) -> Llama3Model.Config:
 llama3_configs = {
     "debugmodel": _debugmodel,
     "debugmodel_fused_qkv": _debugmodel_fused_qkv,
+    "160M": _160m,
     "1B": _1b,
     "3B": _3b,
     "8B": _8b,

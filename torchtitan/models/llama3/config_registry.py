@@ -117,6 +117,51 @@ def llama3_debugmodel_ce_loss() -> Trainer.Config:
     return config
 
 
+def llama3_160m() -> Trainer.Config:
+    return Trainer.Config(
+        loss=ChunkedCELoss.Config(),
+        hf_assets_path="./assets/hf/Llama-2-70b-hf",
+        profiler=Profiler.Config(
+            enable_profiling=True,
+            profile_freq=100,
+        ),
+        metrics=MetricsProcessor.Config(
+            enable_tensorboard=True,
+        ),
+        model_spec=model_registry("160M"),
+        optimizer=default_adamw(
+            lr=5e-3,
+            betas=(0.975, 0.9),
+            eps=1e-8,
+            weight_decay=0.1,
+        ),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=3662,
+            decay_type="cosine",
+            min_lr_factor=0.0,
+        ),
+        training=TrainingConfig(
+            local_batch_size=8,
+            global_batch_size=128,
+            seq_len=2048,
+            max_norm=1.0,
+            steps=36622,
+        ),
+        dataloader=HuggingFaceTextDataLoader.Config(
+            dataset="c4",
+        ),
+        checkpoint=CheckpointManager.Config(interval=500),
+        activation_checkpoint=ActivationCheckpointConfig(
+            mode="selective",
+        ),
+        validator=Validator.Config(
+            enable=True,
+            freq=500,
+            steps=1200,
+        ),
+    )
+
+
 def llama3_8b() -> Trainer.Config:
     return Trainer.Config(
         loss=ChunkedCELoss.Config(),
