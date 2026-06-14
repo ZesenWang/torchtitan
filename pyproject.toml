@@ -11,6 +11,8 @@ authors = [
 keywords = ["pytorch", "training", "llm"]
 dependencies = [
     # Stateful Dataloader
+    "torch>=2.14.0.dev0; sys_platform == 'linux'",
+    "triton; sys_platform == 'linux'",
     "torchdata>=0.8.0",
 
     # Hugging Face integrations
@@ -67,3 +69,16 @@ testpaths = ["tests"]
 project-excludes = ["torchtitan/experiments", "**/tests/**"]
 replace-imports-with-any = ["torchao.*", "torchft", "torchvision.*", "deep_ep.*", "jinja2.*", "fla.*"]  # optional dependencies
 search-path = ["../pytorch"]  # local built pytorch
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-nightly-cu130", marker = "sys_platform == 'linux'" },
+]
+triton = [
+    { index = "pytorch-nightly-cu130", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-nightly-cu130"
+url = "https://download.pytorch.org/whl/nightly/cu130"
+explicit = true
