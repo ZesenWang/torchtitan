@@ -34,6 +34,7 @@ from torchtitan.config.configs import (
     ActivationCheckpointConfig,
     CommConfig,
     CompileConfig,
+    DecentralizedConfig,
     DebugConfig,
     ParallelismConfig,
     TrainingConfig,
@@ -42,6 +43,7 @@ from torchtitan.config.override import apply_overrides, OverrideConfig
 from torchtitan.distributed import full_dtensor, ParallelDims, utils as dist_utils
 from torchtitan.distributed.context_parallel import prepare_context_parallel_input
 from torchtitan.distributed.spmd_types import annotate_input_spmd_types
+from torchtitan.experiments.decentralized import DecentralizedManager
 from torchtitan.models.common.attention import FlexAttention, VarlenAttention
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.observability import structured_logger as sl
@@ -101,6 +103,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         debug: DebugConfig = field(default_factory=DebugConfig)
         override: OverrideConfig = field(default_factory=OverrideConfig)
         loss: BaseLoss.Config = field(default_factory=BaseLoss.Config)
+        decent: DecentralizedConfig = field(default_factory=DecentralizedConfig)
 
         def __post_init__(self):
             if self.debug.batch_invariant:
@@ -187,6 +190,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     validator: BaseValidator
     metrics_processor: MetricsProcessor
     checkpointer: CheckpointManager
+    decent_manager: DecentralizedManager
 
     # runtime utilities
     device: torch.device
@@ -226,11 +230,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # Logging needs to happen after distributed initialized
         config.maybe_log()
 
-        if parallel_dims.dp_enabled:
+        if parallel_dims.batch_enabled:
             batch_mesh = parallel_dims.get_mesh("batch")
-            batch_degree, batch_rank = batch_mesh.size(), batch_mesh.get_local_rank()
+            data_batch_degree = batch_mesh.size()
+            data_batch_rank = batch_mesh.get_local_rank()
         else:
-            batch_degree, batch_rank = 1, 0
+            data_batch_degree, data_batch_rank = 1, 0
 
         # take control of garbage collection to avoid stragglers
         self.gc_handler = utils.GarbageCollection(
@@ -320,19 +325,20 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         if global_batch_size < 0:
             # This global batch size results in 1 gradient accumulation
             # step.
-            global_batch_size = config.training.local_batch_size * batch_degree
+            global_batch_size = config.training.local_batch_size * data_batch_degree
         assert global_batch_size > 0
         assert (
-            global_batch_size % (config.training.local_batch_size * batch_degree) == 0
+            global_batch_size % (config.training.local_batch_size * data_batch_degree)
+            == 0
         ), (
             f"global batch size must be multiple of local batch size times "
             f"data-parallel degree ({global_batch_size} "
-            f"% ({config.training.local_batch_size} * {batch_degree}) != 0)"
+            f"% ({config.training.local_batch_size} * {data_batch_degree}) != 0)"
         )
 
         # calculate gradient accumulation steps
         self.gradient_accumulation_steps = global_batch_size // (
-            config.training.local_batch_size * batch_degree
+            config.training.local_batch_size * data_batch_degree
         )
         assert self.gradient_accumulation_steps > 0
 
@@ -441,6 +447,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             f"({device_mem_stats.max_reserved_pct:.2f}%)"
         )
 
+        self.decent_manager = DecentralizedManager(
+            config.decent,
+            parallel_dims=parallel_dims,
+            parallelism=config.parallelism,
+        )
+
         # build optimizer after applying parallelisms to the model
         self.optimizers = config.optimizer.build(model_parts=self.model_parts)
         if model_spec.post_optimizer_build_fn is not None:
@@ -464,8 +476,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
         # build dataloader
         self.dataloader = config.dataloader.build(
-            dp_world_size=batch_degree,
-            dp_rank=batch_rank,
+            dp_world_size=data_batch_degree,
+            dp_rank=data_batch_rank,
             tokenizer=self.tokenizer,
             seq_len=config.training.seq_len,
             local_batch_size=config.training.local_batch_size,
@@ -517,8 +529,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
             self.validator = config.validator.build(
                 parallelism=config.parallelism,
-                dp_world_size=batch_degree,
-                dp_rank=batch_rank,
+                dp_world_size=data_batch_degree,
+                dp_rank=data_batch_rank,
                 tokenizer=self.tokenizer,
                 parallel_dims=parallel_dims,
                 loss_fn=self.loss_fn,
@@ -535,6 +547,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             "Trainer is initialized with "
             f"local batch size {config.training.local_batch_size}, "
             f"global batch size {global_batch_size}, "
+            f"data batch degree {data_batch_degree}, "
             f"gradient accumulation steps {self.gradient_accumulation_steps}, "
             f"sequence length {config.training.seq_len}, "
             f"total steps {config.training.steps} "
@@ -759,7 +772,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # All-reduce to get global token count across DP ranks
         # Move to GPU for distributed communication
         if parallel_dims.dp_enabled:
-            batch_mesh = parallel_dims.get_mesh("batch")
+            batch_mesh = parallel_dims.get_mesh("train_batch")
             global_valid_tokens = dist_utils.dist_sum(
                 local_valid_tokens.to(self.device), batch_mesh
             )
@@ -791,7 +804,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 ep_enabled=parallel_dims.ep_enabled,
             )
             self.checkpointer.maybe_wait_for_staging()
+            self.decent_manager.before_optimizer_step(
+                self.model_parts,
+                step=self.step,
+            )
             self.optimizers.step()
+            self.decent_manager.after_optimizer_step(
+                self.model_parts,
+                next_step=self.step + 1,
+            )
             self.lr_schedulers.step()
 
         # Reduce the data collected over gradient accumulation steps.
@@ -804,6 +825,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         with sl.log_trace_span("collect_dist_metrics"):
 
             sl.log_trace_scalar({"global_valid_tokens": int(global_valid_tokens)})
+            ntokens_seen_tensor = torch.tensor(
+                self.ntokens_seen, dtype=torch.int64, device=self.device
+            )
+            data_mesh = parallel_dims.get_optional_mesh("data")
+            if data_mesh is not None:
+                global_ntokens_seen = dist_utils.dist_sum(
+                    ntokens_seen_tensor,
+                    data_mesh,
+                )
+            else:
+                global_ntokens_seen = self.ntokens_seen
 
             if parallel_dims.dp_cp_enabled:
                 loss = loss.detach()
@@ -819,19 +851,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 #                = (loss * global_valid_tokens) / local_valid_tokens
                 # global_max_loss = max(local_avg_loss)
                 local_avg_loss = loss * global_valid_tokens / local_valid_tokens
-                global_avg_loss, global_max_loss, global_ntokens_seen = (
+                global_avg_loss, global_max_loss = (
                     dist_utils.dist_sum(loss, loss_mesh),
                     dist_utils.dist_max(local_avg_loss, loss_mesh),
-                    dist_utils.dist_sum(
-                        torch.tensor(
-                            self.ntokens_seen, dtype=torch.int64, device=self.device
-                        ),
-                        loss_mesh,
-                    ),
                 )
             else:
                 global_avg_loss = global_max_loss = float(loss.detach().item())
-                global_ntokens_seen = self.ntokens_seen
 
         extra_metrics = {
             "n_tokens_seen": global_ntokens_seen,
@@ -852,6 +877,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         sl.log_trace_instant("training_start")
 
         self.checkpointer.load(step=config.checkpoint.load_step)
+        self.decent_manager.bootstrap(self.model_parts, next_step=self.step + 1)
 
         # Capture loaded step for relative_step calculation.
         # After checkpoint load: self.step = restored step (e.g. 100), or 0 if fresh.
@@ -886,7 +912,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     if self.config.validator.enable and self.validator.should_validate(
                         self.step
                     ):
-                        self.validator.validate(self.model_parts, self.step)
+                        with self.decent_manager.validation_average_parameters(
+                            self.model_parts
+                        ):
+                            self.validator.validate(self.model_parts, self.step)
 
                     # signal the profiler that the next profiling step has started
                     profiler.step()
@@ -919,6 +948,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.ntokens_seen = state_dict["ntokens_seen"]
 
     def close(self) -> None:
+        if hasattr(self, "decent_manager") and self.decent_manager:
+            self.decent_manager.close()
         if hasattr(self, "checkpointer") and self.checkpointer:
             self.checkpointer.close()
         if hasattr(self, "metrics_processor") and self.metrics_processor:

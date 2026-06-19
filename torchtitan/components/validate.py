@@ -251,7 +251,7 @@ class Validator(BaseValidator):
             local_valid_tokens += (labels != IGNORE_INDEX).sum()
 
             # All-reduce token count across DP ranks to get global token count
-            if parallel_dims.dp_enabled:
+            if parallel_dims.batch_enabled:
                 batch_mesh = parallel_dims.get_mesh("batch")
                 global_valid_tokens = dist_utils.dist_sum(
                     local_valid_tokens, batch_mesh, None
@@ -307,10 +307,9 @@ class Validator(BaseValidator):
         # Compute average loss
         loss = torch.sum(torch.stack(accumulated_losses))
         loss /= num_steps
-        if parallel_dims.dp_cp_enabled:
-            global_avg_loss = dist_utils.dist_sum(
-                loss, parallel_dims.get_optional_mesh("loss")
-            )
+        validation_loss_mesh = parallel_dims.get_optional_mesh("validation_loss")
+        if validation_loss_mesh is not None:
+            global_avg_loss = dist_utils.dist_sum(loss, validation_loss_mesh)
         else:
             global_avg_loss = float(loss.item())
 

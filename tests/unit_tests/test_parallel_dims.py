@@ -84,6 +84,23 @@ class TestParallelDimsValidation(unittest.TestCase):
         self.assertEqual(parallel_dims.world_size, 8)
 
     @patch("torchtitan.distributed.parallel_dims.device_type", "cpu")
+    def test_from_config_with_decent_dp(self):
+        """Test constructing ParallelDims with decentralized data parallelism."""
+        config = ParallelismConfig(
+            decent_dp_degree=2,
+            data_parallel_replicate_degree=1,
+            data_parallel_shard_degree=-1,
+            context_parallel_degree=1,
+            tensor_parallel_degree=2,
+            pipeline_parallel_degree=1,
+            expert_parallel_degree=1,
+        )
+        parallel_dims = ParallelDims.from_config(config, world_size=8)
+        self.assertEqual(parallel_dims.decent_dp, 2)
+        self.assertEqual(parallel_dims.dp_shard, 2)
+        self.assertTrue(parallel_dims.decent_dp_enabled)
+
+    @patch("torchtitan.distributed.parallel_dims.device_type", "cpu")
     def test_auto_calculate_dp_shard(self):
         """Test automatic calculation of dp_shard when set to -1."""
         parallel_dims = ParallelDims(
@@ -94,6 +111,21 @@ class TestParallelDimsValidation(unittest.TestCase):
             pp=1,
             ep=1,
             world_size=8,
+        )
+        self.assertEqual(parallel_dims.dp_shard, 2)
+
+    @patch("torchtitan.distributed.parallel_dims.device_type", "cpu")
+    def test_auto_calculate_dp_shard_with_decent_dp(self):
+        """Test automatic dp_shard calculation accounts for decent_dp."""
+        parallel_dims = ParallelDims(
+            dp_replicate=1,
+            dp_shard=-1,
+            cp=1,
+            tp=2,
+            pp=1,
+            ep=1,
+            world_size=8,
+            decent_dp=2,
         )
         self.assertEqual(parallel_dims.dp_shard, 2)
 
@@ -155,6 +187,7 @@ class TestParallelDimsValidation(unittest.TestCase):
         self.assertTrue(parallel_dims.dp_enabled)
         self.assertTrue(parallel_dims.dp_replicate_enabled)
         self.assertTrue(parallel_dims.dp_shard_enabled)
+        self.assertFalse(parallel_dims.decent_dp_enabled)
         self.assertFalse(parallel_dims.cp_enabled)
         self.assertTrue(parallel_dims.tp_enabled)
         self.assertFalse(parallel_dims.pp_enabled)
@@ -199,6 +232,21 @@ class TestParallelDimsValidation(unittest.TestCase):
             world_size=2,
         )
         self.assertTrue(parallel_dims.pp_enabled)
+
+        # Test with Decentralized DP enabled
+        parallel_dims = ParallelDims(
+            dp_replicate=1,
+            dp_shard=1,
+            cp=1,
+            tp=1,
+            pp=1,
+            ep=1,
+            world_size=2,
+            decent_dp=2,
+        )
+        self.assertTrue(parallel_dims.decent_dp_enabled)
+        self.assertTrue(parallel_dims.batch_enabled)
+        self.assertFalse(parallel_dims.dp_enabled)
 
     @patch("torchtitan.distributed.parallel_dims.device_type", "cpu")
     def test_non_data_parallel_size(self):
@@ -788,6 +836,44 @@ class TestParallelDimsWorld8MeshOperations(DTensorTestBase):
             self.assertEqual(
                 parallel_dims.seq_len_divisor, 4
             )  # tp * (cp * 2) = 2 * (1 * 2) = 2 * 2
+
+
+class TestParallelDimsDecentDPMeshOperations(DTensorTestBase):
+    """Test ParallelDims mesh operations with decentralized data parallelism."""
+
+    @property
+    def world_size(self):
+        return 4
+
+    @with_comms
+    def test_decent_dp_mesh_operations(self):
+        with patch(
+            "torchtitan.distributed.parallel_dims.device_type", self.device_type
+        ):
+            parallel_dims = ParallelDims(
+                dp_replicate=1,
+                dp_shard=2,
+                cp=1,
+                tp=1,
+                pp=1,
+                ep=1,
+                world_size=4,
+                decent_dp=2,
+            )
+            parallel_dims.build_mesh()
+
+            self.assertTrue(parallel_dims.decent_dp_enabled)
+            self.assertTrue(parallel_dims.batch_enabled)
+            self.assertEqual(parallel_dims.get_mesh("decent_dp").size(), 2)
+            self.assertEqual(parallel_dims.get_mesh("batch").size(), 4)
+            self.assertEqual(parallel_dims.get_mesh("train_batch").size(), 2)
+            self.assertEqual(parallel_dims.get_mesh("loss").size(), 2)
+            self.assertEqual(parallel_dims.get_mesh("validation_loss").size(), 4)
+            self.assertEqual(parallel_dims.get_mesh("data").size(), 4)
+
+            fsdp_mesh = parallel_dims.get_mesh("fsdp")
+            self.assertEqual(fsdp_mesh.size(), 2)
+            self.assertEqual(fsdp_mesh.mesh_dim_names, ("fsdp",))
 
 
 class TestSingleGPUMixedPrecisionFSDP(DTensorTestBase):

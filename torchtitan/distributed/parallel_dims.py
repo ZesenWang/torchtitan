@@ -40,8 +40,8 @@ class MeshAxisName(StrEnum):
     those exact spellings when calling into PyTorch APIs (we cannot rename
     upstream surface), but use ``axis`` for any name we own.
     """
-
     DP = "dp"
+    DECENT_DP = "decent_dp"
     DP_REPLICATE = "dp_replicate"
     DP_SHARD = "dp_shard"
     FSDP = "fsdp"
@@ -137,6 +137,7 @@ class ParallelDims:
     ep: int
     world_size: int
     spmd_backend: Literal["default", "full_dtensor", "spmd_types"] = "default"
+    decent_dp: int = 1
     # Cache by axis name(s); DeviceMesh equality is by identity, so reuse
     # is required for ``mesh in spmd_meshes()`` checks.
     _single_axis_meshes: dict[str, DeviceMesh] = field(default_factory=dict)
@@ -157,13 +158,15 @@ class ParallelDims:
             ep=parallelism_config.expert_parallel_degree,
             world_size=world_size,
             spmd_backend=parallelism_config.spmd_backend,
+            decent_dp=parallelism_config.decent_dp_degree,
         )
 
     def __post_init__(self):
         self._validate()
 
     def _validate(self):
-        dp_replicate, dp_shard, cp, tp, pp, ep = (
+        decent_dp, dp_replicate, dp_shard, cp, tp, pp, ep = (
+            self.decent_dp,
             self.dp_replicate,
             self.dp_shard,
             self.cp,
@@ -171,16 +174,21 @@ class ParallelDims:
             self.pp,
             self.ep,
         )
-        for d in (dp_replicate, cp, tp, pp, ep):
+        for d in (decent_dp, dp_replicate, cp, tp, pp, ep):
             assert d >= 1, "Parallelism degree should be >= 1, except for dp_shard"
         assert dp_shard == -1 or dp_shard >= 1, "dp_shard must -1 or >=1."
         if dp_shard < 0:
-            self.dp_shard = dp_shard = self.world_size // (dp_replicate * cp * tp * pp)
+            self.dp_shard = dp_shard = self.world_size // (
+                decent_dp * dp_replicate * cp * tp * pp
+            )
         assert dp_shard >= 1
 
-        assert dp_replicate * dp_shard * cp * tp * pp == self.world_size, (
-            f"Invalid parallel dims: dp_replicate({dp_replicate}) * dp_shard({dp_shard}) * "
-            f"cp({cp}) * tp({tp}) * pp({pp}) != WORLD_SIZE({self.world_size})"
+        assert (
+            decent_dp * dp_replicate * dp_shard * cp * tp * pp == self.world_size
+        ), (
+            f"Invalid parallel dims: decent_dp({decent_dp}) * "
+            f"dp_replicate({dp_replicate}) * dp_shard({dp_shard}) * cp({cp}) * "
+            f"tp({tp}) * pp({pp}) != WORLD_SIZE({self.world_size})"
         )
 
     def _mesh_exist(self, name: str, degree: int) -> bool:
@@ -207,12 +215,21 @@ class ParallelDims:
         The following mesh dimensions will be created:
 
             pp:      Pipeline Parallelism (PP).
+            decent_dp: Decentralized model-copy axis.
             batch:   Used by data loading to determine the global batch size and which
-                     part of the data each rank should read. This dimension includes both
-                     ``dp_replicate`` and ``dp_shard``.
+                     part of the data each rank should read. This dimension includes
+                     ``decent_dp``, ``dp_replicate``, and ``dp_shard``.
+            train_batch: Used by local training loss normalization. This dimension
+                     includes ``dp_replicate`` and ``dp_shard`` but excludes
+                     ``decent_dp``.
             loss:    Used by all-reduce when computing the loss. Includes ``dp_replicate``,
                      ``dp_shard``, and ``cp`` degrees, as all of them parallelize the data,
                      essentially require the weight gradients reduction.
+            validation_loss: Used by validation loss all-reduce. Includes ``decent_dp``,
+                     ``dp_replicate``, ``dp_shard``, and ``cp`` because validation runs
+                     on globally averaged decentralized model parameters.
+            data:    Used by global token accounting. Includes ``decent_dp``,
+                     ``dp_replicate``, ``dp_shard``, and ``cp``.
             dp_replicate: For DDP or HSDP replicate dimension.
             fsdp:    For FSDP dimension. This includes ``dp_shard`` and ``cp``. Note that
                      we always assume that when ``cp`` is used, FSDP is also applied to
@@ -227,11 +244,11 @@ class ParallelDims:
         which is created by flattening the batch and cp dimensions.
         This API performs the following unflatten operations from the world mesh:
 
-            ["pp", "batch", "cp", "tp"]  # dataloading_mesh
-            ["pp", "dp_replicate", "dp_shard", "cp", "tp"]  # full_dtensor dense_mesh
-            ["pp", "dp_replicate", "fsdp", "tp"]  # legacy dense_mesh
-            ["pp", "dp", "cp", "tp"]  # spmd_types dense_mesh
-            ["pp", "dp_replicate", "efsdp", "ep"]  # sparse_mesh
+            ["pp", "decent_dp", "train_batch", "cp", "tp"]  # dataloading_mesh
+            ["pp", "decent_dp", "dp_replicate", "dp_shard", "cp", "tp"]  # full_dtensor dense_mesh
+            ["pp", "decent_dp", "dp_replicate", "fsdp", "tp"]  # legacy dense_mesh
+            ["pp", "decent_dp", "dp", "cp", "tp"]  # spmd_types dense_mesh
+            ["pp", "decent_dp", "dp_replicate", "efsdp", "ep"]  # sparse_mesh
 
         Note: DeviceMesh currently recreates the process group for each dimension.
         It should share the process group for the same dim group to avoid unnecessary
@@ -265,11 +282,12 @@ class ParallelDims:
 
         logger.info(
             f"Building device mesh with parallelism: "
-            f"pp={self.pp}, dp_replicate={self.dp_replicate}, dp_shard={self.dp_shard}, "
+            f"pp={self.pp}, decent_dp={self.decent_dp}, "
+            f"dp_replicate={self.dp_replicate}, dp_shard={self.dp_shard}, "
             f"cp={self.cp}, tp={self.tp}, ep={self.ep}"
         )
 
-        batch = self.dp_replicate * self.dp_shard
+        train_batch = self.dp_replicate * self.dp_shard
         fsdp = self.dp_shard * self.cp
         efsdp = fsdp * self.tp // self.ep
 
@@ -278,10 +296,16 @@ class ParallelDims:
         )
         dataloading_mesh = unflatten_mesh(
             self._world_mesh,
-            ("pp", "batch", "cp", "tp"),
-            (self.pp, batch, self.cp, self.tp),
+            ("pp", "decent_dp", "train_batch", "cp", "tp"),
+            (self.pp, self.decent_dp, train_batch, self.cp, self.tp),
         )
-        loss_mesh = dataloading_mesh["batch", "cp"]._flatten("loss_mesh")
+        batch_mesh = dataloading_mesh["decent_dp", "train_batch"]._flatten(
+            "batch_mesh"
+        )
+        loss_mesh = dataloading_mesh["train_batch", "cp"]._flatten("loss_mesh")
+        data_mesh = dataloading_mesh[
+            "decent_dp", "train_batch", "cp"
+        ]._flatten("data_mesh")
         spmd_dense_mesh_for_fwdbwd = None
         if self.spmd_backend == "full_dtensor":
             # Under full_dtensor, ``dp_shard`` and ``cp`` cannot be folded
@@ -291,8 +315,15 @@ class ParallelDims:
             candidate_spmd_dense_axes = ["dp_replicate", "dp_shard", "cp", "tp"]
             full_dense_mesh_for_fsdp = unflatten_mesh(
                 self._world_mesh,
-                tuple(["pp"] + candidate_spmd_dense_axes),
-                (self.pp, self.dp_replicate, self.dp_shard, self.cp, self.tp),
+                ("pp", "decent_dp", "dp_replicate", "dp_shard", "cp", "tp"),
+                (
+                    self.pp,
+                    self.decent_dp,
+                    self.dp_replicate,
+                    self.dp_shard,
+                    self.cp,
+                    self.tp,
+                ),
             )
         elif self.spmd_backend == "spmd_types":
             # Two mesh views over the same devices:
@@ -310,13 +341,20 @@ class ParallelDims:
             candidate_spmd_dense_axes = ["dp", "cp", "tp"]
             full_dense_mesh_for_fsdp = unflatten_mesh(
                 self._world_mesh,
-                ("pp", "dp_replicate", "dp_shard", "cp", "tp"),
-                (self.pp, self.dp_replicate, self.dp_shard, self.cp, self.tp),
+                ("pp", "decent_dp", "dp_replicate", "dp_shard", "cp", "tp"),
+                (
+                    self.pp,
+                    self.decent_dp,
+                    self.dp_replicate,
+                    self.dp_shard,
+                    self.cp,
+                    self.tp,
+                ),
             )
             full_dense_mesh_for_fwdbwd = unflatten_mesh(
                 self._world_mesh,
-                tuple(["pp"] + candidate_spmd_dense_axes),
-                (self.pp, batch, self.cp, self.tp),
+                ("pp", "decent_dp", "dp", "cp", "tp"),
+                (self.pp, self.decent_dp, train_batch, self.cp, self.tp),
             )
             spmd_dense_mesh_for_fwdbwd = full_dense_mesh_for_fwdbwd["dp", "cp", "tp"]
         else:
@@ -324,19 +362,21 @@ class ParallelDims:
             candidate_spmd_dense_axes = ["dp_replicate", "fsdp", "tp"]
             full_dense_mesh_for_fsdp = unflatten_mesh(
                 self._world_mesh,
-                ("pp", "dp_replicate", "fsdp", "tp"),
-                (self.pp, self.dp_replicate, fsdp, self.tp),
+                ("pp", "decent_dp", "dp_replicate", "fsdp", "tp"),
+                (self.pp, self.decent_dp, self.dp_replicate, fsdp, self.tp),
             )
 
         full_sparse_mesh = unflatten_mesh(
             self._world_mesh,
-            ("pp", "dp_replicate", "efsdp", "ep"),
-            (self.pp, self.dp_replicate, efsdp, self.ep),
+            ("pp", "decent_dp", "dp_replicate", "efsdp", "ep"),
+            (self.pp, self.decent_dp, self.dp_replicate, efsdp, self.ep),
         )
 
         self._global_meshes = {
             "dataloading": dataloading_mesh,
             "loss": loss_mesh,
+            "validation_loss": data_mesh,
+            "data": data_mesh,
             "dense": full_dense_mesh_for_fsdp,
             "sparse": full_sparse_mesh,
         }
@@ -344,8 +384,12 @@ class ParallelDims:
             self._global_meshes["spmd_dense_for_fwdbwd"] = spmd_dense_mesh_for_fwdbwd
         self._single_axis_meshes = {
             "pp": dataloading_mesh["pp"],
-            "batch": dataloading_mesh["batch"],
+            "decent_dp": dataloading_mesh["decent_dp"],
+            "batch": batch_mesh,
+            "train_batch": dataloading_mesh["train_batch"],
             "loss": loss_mesh,
+            "validation_loss": data_mesh,
+            "data": data_mesh,
             "dp_replicate": full_dense_mesh_for_fsdp["dp_replicate"],
             "cp": dataloading_mesh["cp"],
             "tp": dataloading_mesh["tp"],
@@ -383,8 +427,14 @@ class ParallelDims:
         """Validate that created meshes have the expected sizes."""
         expected_sizes = {
             "pp": self.pp,
-            "batch": self.dp_replicate * self.dp_shard,
+            "decent_dp": self.decent_dp,
+            "batch": self.decent_dp * self.dp_replicate * self.dp_shard,
+            "train_batch": self.dp_replicate * self.dp_shard,
             "loss": self.dp_replicate * self.dp_shard * self.cp,
+            "validation_loss": (
+                self.decent_dp * self.dp_replicate * self.dp_shard * self.cp
+            ),
+            "data": self.decent_dp * self.dp_replicate * self.dp_shard * self.cp,
             "dp_replicate": self.dp_replicate,
             "cp": self.cp,
             "tp": self.tp,
@@ -416,7 +466,8 @@ class ParallelDims:
 
         Args:
             dims: Names of the mesh dimension. Valid options include:
-                 'pp', 'batch', 'loss', 'dp_replicate', 'fsdp',
+                 'pp', 'decent_dp', 'batch', 'train_batch', 'loss',
+                 'validation_loss', 'data', 'dp_replicate', 'fsdp',
                  'cp', 'tp', 'ep', 'efsdp'.
             include_singleton_axes: Include axes with size 1 in the returned
                  submesh. Only current usecase is in spmd_types backend distributed
@@ -479,7 +530,8 @@ class ParallelDims:
 
         Args:
             dims: Names of the mesh dimension. Valid options include:
-                 'pp', 'batch', 'loss', 'dp_replicate', 'fsdp',
+                 'pp', 'decent_dp', 'batch', 'train_batch', 'loss',
+                 'validation_loss', 'data', 'dp_replicate', 'fsdp',
                  'cp', 'tp', 'ep', 'efsdp'.
 
         Returns:
@@ -633,6 +685,14 @@ class ParallelDims:
         if self._world_mesh is None:
             self._world_mesh = self.build_mesh()
         return self._world_mesh
+
+    @property
+    def decent_dp_enabled(self):
+        return self.decent_dp > 1
+
+    @property
+    def batch_enabled(self):
+        return self.decent_dp_enabled or self.dp_enabled
 
     @property
     def dp_enabled(self):

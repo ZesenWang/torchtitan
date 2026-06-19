@@ -260,6 +260,22 @@ class ParallelismConfig:
     pp and dp_replicate are outer dimensions unaffected by this constraint.
     """
 
+    decent_dp_degree: int = 1
+    """
+    Decentralized data parallelism degree. This creates independent model-copy
+    peers that can be mixed by ``decent`` training algorithms. 1 means disabled.
+    """
+
+
+@dataclass(kw_only=True, slots=True)
+class DecentralizedConfig:
+    enable: bool = False
+    algorithm: Literal["model_mixing"] = "model_mixing"
+    topology: Literal["one_peer_ring"] = "one_peer_ring"
+    overlap: bool = True
+    bucket_size_mb: int = 256
+    """Maximum decentralized parameter communication bucket size in MiB."""
+
 
 @dataclass(kw_only=True, slots=True)
 class ActivationCheckpointConfig:
