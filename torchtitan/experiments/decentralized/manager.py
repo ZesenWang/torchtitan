@@ -45,6 +45,10 @@ class DecentralizedManager:
         self._comm_buffer_views: list[torch.Tensor] = []
         self._pair_groups: dict[int, dist.ProcessGroup] = {}
         self._decent_group: dist.ProcessGroup | None = None
+        self._shard_group: dist.ProcessGroup | None = None
+        self._validation_distance_metric_name = (
+            "validation_metrics/decent/mean_l2_distance_to_global_average"
+        )
 
         if not self.enabled:
             if parallel_dims.decent_dp_enabled:
@@ -107,6 +111,15 @@ class DecentralizedManager:
 
         for pp_idx in range(self.parallel_dims.pp):
             pp_base = pp_idx * decent_dp * inner_size
+            for decent_rank in range(decent_dp):
+                ranks = [
+                    pp_base + decent_rank * inner_size + inner_idx
+                    for inner_idx in range(inner_size)
+                ]
+                group = dist.new_group(ranks=ranks)
+                if world_rank in ranks:
+                    self._shard_group = group
+
             for inner_idx in range(inner_size):
                 peers = [
                     pp_base + decent_rank * inner_size + inner_idx
@@ -127,6 +140,9 @@ class DecentralizedManager:
         )
         assert self._decent_group is not None, (
             "Current rank must belong to one decentralized global group."
+        )
+        assert self._shard_group is not None, (
+            "Current rank must belong to one decentralized shard group."
         )
 
     @staticmethod
@@ -276,6 +292,28 @@ class DecentralizedManager:
             self.config.bucket_size_mb,
         )
 
+    def _mean_l2_distance_to_global_average(
+        self,
+        local_tensors: list[torch.Tensor],
+        average_tensors: list[torch.Tensor],
+    ) -> float:
+        assert self._decent_group is not None
+        assert self._shard_group is not None
+
+        device = local_tensors[0].device if local_tensors else torch.device("cpu")
+        local_squared_distance = torch.zeros((), device=device, dtype=torch.float32)
+        for local_tensor, average_tensor in zip(
+            local_tensors, average_tensors, strict=True
+        ):
+            diff = local_tensor.float() - average_tensor.float()
+            local_squared_distance += diff.square().sum()
+
+        dist.all_reduce(local_squared_distance, group=self._shard_group)
+        local_distance = local_squared_distance.sqrt()
+        dist.all_reduce(local_distance, group=self._decent_group)
+        local_distance /= self.parallel_dims.decent_dp
+        return float(local_distance.item())
+
     def bootstrap(self, model_parts: list[nn.Module], *, next_step: int) -> None:
         if not self.enabled:
             return
@@ -332,9 +370,9 @@ class DecentralizedManager:
     def validation_average_parameters(
         self,
         model_parts: list[nn.Module],
-    ) -> Iterator[None]:
+    ) -> Iterator[dict[str, float] | None]:
         if not self.enabled:
-            yield
+            yield None
             return
 
         assert self._decent_group is not None
@@ -370,11 +408,19 @@ class DecentralizedManager:
                             [bucket.buffer for bucket in validation_buckets],
                             1.0 / self.parallel_dims.decent_dp,
                         )
+                        extra_metrics = {
+                            self._validation_distance_metric_name: (
+                                self._mean_l2_distance_to_global_average(
+                                    local_tensors,
+                                    validation_bucket_views,
+                                )
+                            )
+                        }
                         self._foreach_copy_local_tensors_(
                             params,
                             validation_bucket_views,
                         )
-                yield
+                yield extra_metrics
             finally:
                 with torch.no_grad():
                     with torch.profiler.record_function(

@@ -43,7 +43,12 @@ class BaseValidator(Configurable):
     ):
         self.config = config
 
-    def validate(self, model_parts: list[nn.Module], step: int) -> None:
+    def validate(
+        self,
+        model_parts: list[nn.Module],
+        step: int,
+        extra_metrics: dict[str, Any] | None = None,
+    ) -> None:
         raise NotImplementedError("validate method not implemented")
 
     def should_validate(self, step: int) -> bool:
@@ -216,6 +221,7 @@ class Validator(BaseValidator):
         self,
         model_parts: list[nn.Module],
         step: int,
+        extra_metrics: dict[str, Any] | None = None,
     ) -> None:
         sl.add_step_tag("eval")
         # Set model to eval mode
@@ -313,7 +319,11 @@ class Validator(BaseValidator):
         else:
             global_avg_loss = float(loss.item())
 
-        self.metrics_processor.log_validation(loss=global_avg_loss, step=step)
+        self.metrics_processor.log_validation(
+            loss=global_avg_loss,
+            step=step,
+            extra_metrics=extra_metrics,
+        )
 
         # Set model back to train mode
         for model in model_parts:

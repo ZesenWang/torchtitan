@@ -914,8 +914,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     ):
                         with self.decent_manager.validation_average_parameters(
                             self.model_parts
-                        ):
-                            self.validator.validate(self.model_parts, self.step)
+                        ) as extra_metrics:
+                            self.validator.validate(
+                                self.model_parts,
+                                self.step,
+                                extra_metrics=extra_metrics,
+                            )
 
                     # signal the profiler that the next profiling step has started
                     profiler.step()
