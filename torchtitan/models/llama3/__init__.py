@@ -172,15 +172,14 @@ def _160m(attn_backend: str) -> Llama3Model.Config:
     dim = 768
     n_heads = 12
     n_layers = 18
-    vocab_size = 32000
+    vocab_size = 128256
     return Llama3Model.Config(
         dim=dim,
         vocab_size=vocab_size,
-        enable_weight_tying=True,
         tok_embeddings=Embedding.Config(
             num_embeddings=vocab_size,
             embedding_dim=dim,
-            param_init=_EMBEDDING_SKIP_INIT,
+            param_init=_EMBEDDING_INIT,
         ),
         norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
         lm_head=Linear.Config(

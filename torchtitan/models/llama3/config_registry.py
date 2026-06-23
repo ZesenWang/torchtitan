@@ -120,7 +120,7 @@ def llama3_debugmodel_ce_loss() -> Trainer.Config:
 def llama3_160m() -> Trainer.Config:
     return Trainer.Config(
         loss=ChunkedCELoss.Config(),
-        hf_assets_path="./assets/hf/Llama-2-70b-hf",
+        hf_assets_path="./assets/hf/Llama-3.1-8B",
         profiler=Profiler.Config(
             enable_profiling=True,
             profile_freq=100,
