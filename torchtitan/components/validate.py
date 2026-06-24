@@ -34,7 +34,7 @@ class BaseValidator(Configurable):
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
         freq: int = 10
-        """Frequency of validation"""
+        """Frequency of validation. Validation also runs on the first and final step."""
 
     def __init__(
         self,
@@ -51,8 +51,8 @@ class BaseValidator(Configurable):
     ) -> None:
         raise NotImplementedError("validate method not implemented")
 
-    def should_validate(self, step: int) -> bool:
-        return step == 1 or step % self.config.freq == 0
+    def should_validate(self, step: int, *, last_step: bool = False) -> bool:
+        return step == 1 or step % self.config.freq == 0 or last_step
 
 
 class Validator(BaseValidator):

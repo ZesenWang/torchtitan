@@ -910,7 +910,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
                     # Run validation if validator is available
                     if self.config.validator.enable and self.validator.should_validate(
-                        self.step
+                        self.step, last_step=(self.step == config.training.steps)
                     ):
                         with self.decent_manager.validation_average_parameters(
                             self.model_parts
