@@ -32,16 +32,16 @@ class TestDecentralizedManager(DTensorTestBase):
     def world_size(self) -> int:
         return 4
 
-    def _parallel_dims(self) -> ParallelDims:
+    def _parallel_dims(self, *, decent_dp: int = 2, dp_shard: int = 2) -> ParallelDims:
         return ParallelDims(
             dp_replicate=1,
-            dp_shard=2,
+            dp_shard=dp_shard,
             cp=1,
             tp=1,
             pp=1,
             ep=1,
             world_size=4,
-            decent_dp=2,
+            decent_dp=decent_dp,
         )
 
     @with_comms
@@ -91,6 +91,51 @@ class TestDecentralizedManager(DTensorTestBase):
             self.assertEqual(float(model.weight.item()), float(rank))
 
         self.assertEqual(float(model.weight.item()), float(rank))
+
+    @with_comms
+    def test_complete_model_mixing_averages_all_peers(self) -> None:
+        rank = dist.get_rank()
+        model = _SingleParameterModel(float(2 * rank), self.device_type)
+        manager = DecentralizedManager(
+            DecentralizedConfig(
+                enable=True,
+                topology="complete",
+                bucket_size_mb=1,
+            ),
+            parallel_dims=self._parallel_dims(decent_dp=4, dp_shard=1),
+            parallelism=ParallelismConfig(decent_dp_degree=4),
+        )
+
+        manager.bootstrap([model], next_step=1)
+        manager.before_optimizer_step([model], step=1)
+
+        self.assertEqual(float(model.weight.item()), 3.0)
+        manager.close()
+
+    @with_comms
+    def test_one_peer_exponential_model_mixing_cycles_power_of_two_offsets(
+        self,
+    ) -> None:
+        rank = dist.get_rank()
+        model = _SingleParameterModel(float(2 * rank), self.device_type)
+        manager = DecentralizedManager(
+            DecentralizedConfig(
+                enable=True,
+                topology="one_peer_exponential",
+                bucket_size_mb=1,
+            ),
+            parallel_dims=self._parallel_dims(decent_dp=4, dp_shard=1),
+            parallelism=ParallelismConfig(decent_dp_degree=4),
+        )
+
+        manager.bootstrap([model], next_step=1)
+        manager.before_optimizer_step([model], step=1)
+        self.assertEqual(float(model.weight.item()), 1.0 if rank < 2 else 5.0)
+
+        manager.after_optimizer_step([model], next_step=2)
+        manager.before_optimizer_step([model], step=2)
+        self.assertEqual(float(model.weight.item()), 3.0)
+        manager.close()
 
 
 if __name__ == "__main__":

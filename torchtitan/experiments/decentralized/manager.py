@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -43,7 +44,7 @@ class DecentralizedManager:
         self._pending_works: list[Any] = []
         self._comm_buckets: list[_CommBucket] = []
         self._comm_buffer_views: list[torch.Tensor] = []
-        self._pair_groups: dict[int, dist.ProcessGroup] = {}
+        self._peer_groups: dict[int, dist.ProcessGroup] = {}
         self._decent_group: dist.ProcessGroup | None = None
         self._shard_group: dist.ProcessGroup | None = None
         self._validation_distance_metric_name = (
@@ -60,9 +61,10 @@ class DecentralizedManager:
             return
 
         self._validate_config(parallelism)
-        self._create_pair_groups()
+        self._create_communication_groups()
         logger.info(
-            "Enabled decentralized model mixing with one-peer ring topology "
+            "Enabled decentralized model mixing with "
+            f"{self.config.topology} topology "
             f"(decent_dp={parallel_dims.decent_dp})"
         )
 
@@ -72,10 +74,15 @@ class DecentralizedManager:
                 "decent.algorithm only supports 'model_mixing' in this "
                 "experimental path."
             )
-        if self.config.topology != "one_peer_ring":
+        supported_topologies = {
+            "one_peer_ring",
+            "complete",
+            "one_peer_exponential",
+        }
+        if self.config.topology not in supported_topologies:
             raise ValueError(
-                "decent.topology only supports 'one_peer_ring' in this "
-                "experimental path."
+                "decent.topology must be one of "
+                f"{sorted(supported_topologies)}."
             )
         if self.config.bucket_size_mb <= 0:
             raise ValueError("decent.bucket_size_mb must be positive.")
@@ -83,8 +90,19 @@ class DecentralizedManager:
             raise ValueError("decent.overlap=False is not implemented.")
         if not self.parallel_dims.decent_dp_enabled:
             raise ValueError("decent.enable requires parallelism.decent_dp_degree > 1.")
-        if self.parallel_dims.decent_dp % 2 != 0:
+        if (
+            self.config.topology == "one_peer_ring"
+            and self.parallel_dims.decent_dp % 2 != 0
+        ):
             raise ValueError("decent_dp_degree must be even for one-peer ring mixing.")
+        if (
+            self.config.topology == "one_peer_exponential"
+            and not self._is_power_of_two(self.parallel_dims.decent_dp)
+        ):
+            raise ValueError(
+                "decent_dp_degree must be a power of two for one-peer "
+                "exponential graph mixing."
+            )
         if parallelism.spmd_backend != "default":
             raise ValueError(
                 "decentralized training currently supports only default SPMD backend."
@@ -103,7 +121,11 @@ class DecentralizedManager:
                 "decentralized training does not support expert parallelism yet."
             )
 
-    def _create_pair_groups(self) -> None:
+    @staticmethod
+    def _is_power_of_two(value: int) -> bool:
+        return value > 0 and value & (value - 1) == 0
+
+    def _create_communication_groups(self) -> None:
         decent_dp = self.parallel_dims.decent_dp
         inner_size = self.parallel_dims.dp_replicate * self.parallel_dims.dp_shard
         inner_size *= self.parallel_dims.cp * self.parallel_dims.tp
@@ -128,22 +150,62 @@ class DecentralizedManager:
                 decent_group = dist.new_group(ranks=peers)
                 if world_rank in peers:
                     self._decent_group = decent_group
-                for round_idx in (0, 1):
-                    for start in range(round_idx, decent_dp, 2):
-                        ranks = [peers[start], peers[(start + 1) % decent_dp]]
-                        group = dist.new_group(ranks=ranks)
-                        if world_rank in ranks:
-                            self._pair_groups[round_idx] = group
+                if self.config.topology == "one_peer_ring":
+                    self._create_one_peer_ring_groups(peers, world_rank)
+                elif self.config.topology == "one_peer_exponential":
+                    self._create_one_peer_exponential_groups(peers, world_rank)
 
-        assert set(self._pair_groups) == {0, 1}, (
-            "Current rank must belong to one decentralized pair group per round."
-        )
+        expected_group_indices = self._expected_peer_group_indices()
+        if expected_group_indices:
+            assert set(self._peer_groups) == expected_group_indices, (
+                "Current rank must belong to one decentralized peer group per "
+                "communication round."
+            )
         assert self._decent_group is not None, (
             "Current rank must belong to one decentralized global group."
         )
         assert self._shard_group is not None, (
             "Current rank must belong to one decentralized shard group."
         )
+
+    def _create_one_peer_ring_groups(
+        self,
+        peers: list[int],
+        world_rank: int,
+    ) -> None:
+        for round_idx in (0, 1):
+            for start in range(round_idx, self.parallel_dims.decent_dp, 2):
+                ranks = [
+                    peers[start],
+                    peers[(start + 1) % self.parallel_dims.decent_dp],
+                ]
+                group = dist.new_group(ranks=ranks)
+                if world_rank in ranks:
+                    self._peer_groups[round_idx] = group
+
+    def _create_one_peer_exponential_groups(
+        self,
+        peers: list[int],
+        world_rank: int,
+    ) -> None:
+        for round_idx in range(int(math.log2(self.parallel_dims.decent_dp))):
+            # One-peer exponential graph cycles through offsets 2**round_idx.
+            offset = 1 << round_idx
+            for decent_rank in range(self.parallel_dims.decent_dp):
+                partner_rank = decent_rank ^ offset
+                if decent_rank > partner_rank:
+                    continue
+                ranks = [peers[decent_rank], peers[partner_rank]]
+                group = dist.new_group(ranks=ranks)
+                if world_rank in ranks:
+                    self._peer_groups[round_idx] = group
+
+    def _expected_peer_group_indices(self) -> set[int]:
+        if self.config.topology == "one_peer_ring":
+            return {0, 1}
+        if self.config.topology == "one_peer_exponential":
+            return set(range(int(math.log2(self.parallel_dims.decent_dp))))
+        return set()
 
     @staticmethod
     def _local_tensor(param: torch.Tensor) -> torch.Tensor:
@@ -346,7 +408,7 @@ class DecentralizedManager:
             with torch.profiler.record_function("decent.apply_model_mix"):
                 self._foreach_mul_tensors_(
                     [bucket.buffer for bucket in self._comm_buckets],
-                    0.5,
+                    self._communication_scale(),
                 )
                 self._foreach_copy_local_tensors_(params, self._comm_buffer_views)
 
@@ -439,7 +501,7 @@ class DecentralizedManager:
                 "were created."
             )
 
-        group = self._pair_groups[step % 2]
+        group = self._communication_group(step)
         self._pending_works = []
         with torch.profiler.record_function("decent.copy_params_to_comm_buffers"):
             self._foreach_copy_tensors_(
@@ -451,6 +513,21 @@ class DecentralizedManager:
                 self._pending_works.append(
                     dist.all_reduce(bucket.buffer, group=group, async_op=True)
                 )
+
+    def _communication_group(self, step: int) -> dist.ProcessGroup:
+        if self.config.topology == "complete":
+            assert self._decent_group is not None
+            return self._decent_group
+        if self.config.topology == "one_peer_ring":
+            return self._peer_groups[step % 2]
+        assert self.config.topology == "one_peer_exponential"
+        round_idx = (step - 1) % int(math.log2(self.parallel_dims.decent_dp))
+        return self._peer_groups[round_idx]
+
+    def _communication_scale(self) -> float:
+        if self.config.topology == "complete":
+            return 1.0 / self.parallel_dims.decent_dp
+        return 0.5
 
     def close(self) -> None:
         with torch.profiler.record_function("decent.close"):

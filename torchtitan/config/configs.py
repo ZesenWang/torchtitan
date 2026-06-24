@@ -271,7 +271,9 @@ class ParallelismConfig:
 class DecentralizedConfig:
     enable: bool = False
     algorithm: Literal["model_mixing"] = "model_mixing"
-    topology: Literal["one_peer_ring"] = "one_peer_ring"
+    topology: Literal[
+        "one_peer_ring", "complete", "one_peer_exponential"
+    ] = "one_peer_ring"
     overlap: bool = True
     bucket_size_mb: int = 256
     """Maximum decentralized parameter communication bucket size in MiB."""
