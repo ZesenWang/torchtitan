@@ -17,6 +17,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import Checkpoi
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.tensor import Replicate
 from torch.optim import Optimizer
+from torchtitan.components.accum_adamw import AccumAdamW
 from torchtitan.components.checkpoint_utils import (
     canonical_fqn,
     get_flat_optim_state_dict,
@@ -28,6 +29,7 @@ from torchtitan.distributed import ParallelDims
 from torchtitan.tools.logging import logger
 
 __all__ = [
+    "AccumAdamW",
     "OptimizersContainer",
     "ParamGroupConfig",
     "default_adamw",
@@ -123,6 +125,7 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
     @staticmethod
     def _resolve_optimizer_cls(name: str) -> type:
         optimizer_classes = {
+            "AccumAdamW": AccumAdamW,
             "Adam": torch.optim.Adam,
             "AdamW": torch.optim.AdamW,
         }
@@ -233,6 +236,7 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
             "nesterov",
             "fused",
             "foreach",
+            "accumulation_steps",
         }
         opt_name = type(optimizer).__name__
         for group, pattern in zip(optimizer.param_groups, patterns):

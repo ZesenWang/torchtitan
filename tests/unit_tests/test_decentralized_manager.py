@@ -13,6 +13,7 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
     DTensorTestBase,
     with_comms,
 )
+from torchtitan.components.optimizer import AccumAdamW
 
 from torchtitan.config.configs import DecentralizedConfig, ParallelismConfig
 from torchtitan.distributed import ParallelDims
@@ -135,6 +136,42 @@ class TestDecentralizedManager(DTensorTestBase):
         manager.after_optimizer_step([model], next_step=2)
         manager.before_optimizer_step([model], step=2)
         self.assertEqual(float(model.weight.item()), 3.0)
+        manager.close()
+
+    @with_comms
+    def test_model_mixing_sequence_runs_with_accum_adamw(self) -> None:
+        rank = dist.get_rank()
+        model = _SingleParameterModel(float(rank), self.device_type)
+        optimizer = AccumAdamW(
+            model.parameters(),
+            lr=0.1,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=0.0,
+            accumulation_steps=2,
+            foreach=False,
+        )
+        manager = DecentralizedManager(
+            DecentralizedConfig(
+                enable=True,
+                topology="complete",
+                bucket_size_mb=1,
+            ),
+            parallel_dims=self._parallel_dims(decent_dp=4, dp_shard=1),
+            parallelism=ParallelismConfig(decent_dp_degree=4),
+        )
+
+        manager.bootstrap([model], next_step=1)
+        manager.before_optimizer_step([model], step=1)
+        self.assertEqual(float(model.weight.item()), 1.5)
+
+        model.weight.grad = torch.ones_like(model.weight)
+        optimizer.step()
+        self.assertAlmostEqual(float(model.weight.item()), 1.4, places=5)
+
+        manager.after_optimizer_step([model], next_step=2)
+        manager.before_optimizer_step([model], step=2)
+        self.assertAlmostEqual(float(model.weight.item()), 1.4, places=5)
         manager.close()
 
 
